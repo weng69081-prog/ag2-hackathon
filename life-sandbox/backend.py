@@ -1,39 +1,35 @@
 """Life Sandbox backend — FastAPI + AG2 Beta multi-agent pipeline.
 
+All agents use free-text responses (no response_schema). The pipeline parses
+JSON from the free-text reply using json.loads() and validates with Pydantic.
+
 Pipeline (all agents typed via response_schema):
 
   POST /simulate (UserProfile)
         ↓
-  coordinator               → PathCandidates (3 paths)
+  coordinator               → PathCandidates (5 paths)
         ↓
   asyncio.gather(
       career_eval.ask()     → CareerOutput
       finance_eval.ask()    → FinanceOutput
       risk_eval.ask()       → RiskOutput
+      lifestyle_eval.ask()  → LifestyleOutput
   )
         ↓
-  decision_agent            → DecisionOutput (top 3 ranked)
+  decision_agent            → DecisionOutput (initial ranking)
         ↓
-  return DecisionOutput
+  critic_agent              → CritiqueOutput
+        ↓
+  decision_agent (revise)   → DecisionOutput (revised ranking)
+        ↓
+  return SimulateResponse
 
 Endpoints:
   GET  /healthz             → liveness + provider/model info
-  GET  /docs                → FastAPI auto-generated OpenAPI UI (for frontend integration)
-  POST /ingest              → fetch user-supplied URLs (LinkedIn, GitHub, etc.) and summarize via the ingest agent
-  POST /simulate            → run pipeline, return final ranked top-3
-  POST /simulate/stream     → run pipeline, stream progress events via SSE (text/event-stream)
-
-The streaming endpoint emits these JSON-encoded SSE events in order:
-  event: stage      data: {"stage": "candidates"}        # start
-  event: candidates data: PathCandidates                  # 3 paths
-  event: stage      data: {"stage": "evaluating"}
-  event: career     data: CareerOutput
-  event: finance    data: FinanceOutput
-  event: risk       data: RiskOutput
-  event: stage      data: {"stage": "deciding"}
-  event: decision   data: DecisionOutput                  # final
-  event: done       data: {"ok": true}
-  event: error      data: {"error": "<message>"}         # on failure (terminal)
+  GET  /docs                → FastAPI auto-generated OpenAPI UI
+  POST /ingest              → fetch user-supplied URLs and summarize
+  POST /simulate            → run pipeline, return final ranked top-3 + critique
+  POST /simulate/stream     → run pipeline, stream progress events via SSE
 """
 
 from __future__ import annotations
@@ -41,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -82,6 +79,7 @@ from schemas import (
     ProfileExtract,
     RankedPath,
     RiskOutput,
+    SimulateResponse,
     UserProfile,
 )
 
@@ -89,8 +87,45 @@ load_dotenv()
 
 
 # ---------------------------------------------------------------------------
-# Agents — built once at module import. Each `ask()` is independent / stateless,
-# so we can reuse the same agent across requests.
+# JSON extraction helper
+# ---------------------------------------------------------------------------
+
+
+def _extract_json(text: str) -> str:
+    """Extract JSON from the LLM's response, stripping markdown fences if present."""
+    # Try to extract from ```json ... ``` block
+    m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    # Try to find a top-level { ... } block
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if m:
+        return m.group(0).strip()
+    return text.strip()
+
+
+async def _parse_reply(reply, model_class, retries: int = 2) -> BaseModel:
+    """Ask the agent and parse free-text response into a Pydantic model."""
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            raw = await reply.content(retries=0)  # no retry inside
+            if hasattr(raw, "strip"):  # string
+                text = raw
+            else:
+                text = str(raw)
+            json_str = _extract_json(text)
+            data = json.loads(json_str)
+            return model_class.model_validate(data)
+        except Exception as e:
+            last_error = e
+            if attempt < retries:
+                continue
+    raise ValueError(f"Failed to parse {model_class.__name__} after {retries + 1} attempts: {last_error}")
+
+
+# ---------------------------------------------------------------------------
+# Agents — built once at module import
 # ---------------------------------------------------------------------------
 
 
@@ -107,7 +142,7 @@ career_advice_agent = build_career_advice_agent()
 
 
 # ---------------------------------------------------------------------------
-# Pipeline
+# Pipeline helpers
 # ---------------------------------------------------------------------------
 
 
@@ -145,65 +180,51 @@ async def _generate_candidates(profile: UserProfile) -> PathCandidates:
         f"{_profile_block(profile)}\n"
         "Propose exactly 5 distinct, realistic career path archetypes for this user. "
         "Span a meaningful range of trade-offs (stable corporate IC, founder, specialist, "
-        "creative/freelance, plus one wildcard). The user will pick 1-3 of these to "
-        "evaluate in depth."
+        "creative/freelance, and a wildcard). Be specific — name the role and typical "
+        "employer type. Avoid duplicates."
     )
     reply = await coordinator.ask(prompt)
-    return await reply.content(retries=2)
-
-
-async def _expand_custom_path(profile: UserProfile, description: str) -> PathCandidate:
-    prompt = (
-        f"{_profile_block(profile)}\n"
-        f"User-described career path:\n  {description!r}\n\n"
-        "Return a single PathCandidate normalized for downstream evaluators."
-    )
-    reply = await path_expander.ask(prompt)
-    return await reply.content(retries=2)
+    return await _parse_reply(reply, PathCandidates)
 
 
 async def _evaluate_career(profile: UserProfile, paths: list[PathCandidate]) -> CareerOutput:
     prompt = (
         f"{_profile_block(profile)}\n"
-        f"Candidate paths (evaluate ALL provided, in order, by id):\n"
-        f"{_paths_json(paths)}\n\n"
-        "Return one CareerEval per path. Use the provided `id` as path_id."
+        f"Candidate paths:\n{_paths_json(paths)}\n\n"
+        "Return evals for each path."
     )
     reply = await career_eval.ask(prompt)
-    return await reply.content(retries=2)
+    return await _parse_reply(reply, CareerOutput)
 
 
 async def _evaluate_finance(profile: UserProfile, paths: list[PathCandidate]) -> FinanceOutput:
     prompt = (
         f"{_profile_block(profile)}\n"
-        f"Candidate paths (evaluate ALL provided, in order, by id):\n"
-        f"{_paths_json(paths)}\n\n"
-        "Return one FinanceEval per path. Use the provided `id` as path_id."
+        f"Candidate paths:\n{_paths_json(paths)}\n\n"
+        "Return evals for each path."
     )
     reply = await finance_eval.ask(prompt)
-    return await reply.content(retries=2)
+    return await _parse_reply(reply, FinanceOutput)
 
 
 async def _evaluate_risk(profile: UserProfile, paths: list[PathCandidate]) -> RiskOutput:
     prompt = (
         f"{_profile_block(profile)}\n"
-        f"Candidate paths (evaluate ALL provided, in order, by id):\n"
-        f"{_paths_json(paths)}\n\n"
-        "Return one RiskEval per path. Use the provided `id` as path_id."
+        f"Candidate paths:\n{_paths_json(paths)}\n\n"
+        "Return evals for each path."
     )
     reply = await risk_eval.ask(prompt)
-    return await reply.content(retries=2)
+    return await _parse_reply(reply, RiskOutput)
 
 
 async def _evaluate_lifestyle(profile: UserProfile, paths: list[PathCandidate]) -> LifestyleOutput:
     prompt = (
         f"{_profile_block(profile)}\n"
-        f"Candidate paths (evaluate ALL provided, in order, by id):\n"
-        f"{_paths_json(paths)}\n\n"
-        "Return one LifestyleEval per path. Use the provided `id` as path_id."
+        f"Candidate paths:\n{_paths_json(paths)}\n\n"
+        "Return evals for each path."
     )
     reply = await lifestyle_eval.ask(prompt)
-    return await reply.content(retries=2)
+    return await _parse_reply(reply, LifestyleOutput)
 
 
 async def _decide(
@@ -216,19 +237,38 @@ async def _decide(
 ) -> DecisionOutput:
     prompt = (
         f"{_profile_block(profile)}\n"
-        f"Selected paths ({len(paths)}):\n{_paths_json(paths)}\n\n"
+        f"Candidate paths ({len(paths)}):\n{_paths_json(paths)}\n\n"
         f"Career evaluations:\n{career.model_dump_json(indent=2)}\n\n"
         f"Finance evaluations:\n{finance.model_dump_json(indent=2)}\n\n"
         f"Risk evaluations:\n{risk.model_dump_json(indent=2)}\n\n"
         f"Lifestyle evaluations:\n{lifestyle.model_dump_json(indent=2)}\n\n"
-        "Score each path with a utility function tailored to THIS user's "
-        f"risk_tolerance and ambition. Return ALL {len(paths)} paths sorted by utility, "
-        "highest first. Surface salary curves, EV, ruin probability, growth rate, "
-        "work hours, pressure level, wlb_score, and burnout probability from the "
-        "evaluations into each RankedPath."
+        "Rank these paths by utility for THIS user. Return top3 sorted by utility, highest first."
     )
     reply = await decision_agent.ask(prompt)
-    return await reply.content(retries=2)
+    return await _parse_reply(reply, DecisionOutput)
+
+
+async def _critique(
+    profile: UserProfile,
+    paths: list[PathCandidate],
+    career: CareerOutput,
+    finance: FinanceOutput,
+    risk: RiskOutput,
+    lifestyle: LifestyleOutput,
+    decision: DecisionOutput,
+) -> CritiqueOutput:
+    prompt = (
+        f"{_profile_block(profile)}\n"
+        f"User-selected paths ({len(paths)}):\n{_paths_json(paths)}\n\n"
+        f"Career evaluations:\n{career.model_dump_json(indent=2)}\n\n"
+        f"Finance evaluations:\n{finance.model_dump_json(indent=2)}\n\n"
+        f"Risk evaluations:\n{risk.model_dump_json(indent=2)}\n\n"
+        f"Lifestyle evaluations:\n{lifestyle.model_dump_json(indent=2)}\n\n"
+        f"Decision agent's ranking:\n{decision.model_dump_json(indent=2)}\n\n"
+        "Challenge this ranking."
+    )
+    reply = await critic_agent.ask(prompt)
+    return await _parse_reply(reply, CritiqueOutput)
 
 
 async def _revise_decision(
@@ -241,11 +281,6 @@ async def _revise_decision(
     initial: DecisionOutput,
     critique: CritiqueOutput,
 ) -> DecisionOutput:
-    """Decision agent's second pass — re-scores and re-ranks given the critic's feedback.
-
-    Same agent, same response_schema. The prompt explicitly includes the critic's
-    challenges so the LLM can adjust utility scores, why-it-fits, and tradeoffs.
-    """
     prompt = (
         f"{_profile_block(profile)}\n"
         f"Selected paths ({len(paths)}):\n{_paths_json(paths)}\n\n"
@@ -260,11 +295,10 @@ async def _revise_decision(
         "mismatch with user preferences), adjust utility scores, why-it-fits, and "
         "tradeoffs accordingly. Where the critic is wrong, defend your prior ranking "
         "by keeping the score and tightening the why/tradeoffs to address the "
-        "challenge. Always return ALL "
-        f"{len(paths)} paths sorted by utility, highest first."
+        "challenge. Always return ALL paths sorted by utility, highest first."
     )
     reply = await decision_agent.ask(prompt)
-    return await reply.content(retries=2)
+    return await _parse_reply(reply, DecisionOutput)
 
 
 async def _analyze(profile: UserProfile, selected: list[PathCandidate]) -> DecisionOutput:
@@ -278,36 +312,49 @@ async def _analyze(profile: UserProfile, selected: list[PathCandidate]) -> Decis
     return await _decide(profile, selected, career, finance, risk, lifestyle)
 
 
-async def _critique(
-    profile: UserProfile,
-    paths: list[PathCandidate],
-    career: CareerOutput,
-    finance: FinanceOutput,
-    risk: RiskOutput,
-    lifestyle: LifestyleOutput,
-    decision: DecisionOutput,
-) -> CritiqueOutput:
-    """Adversarial pass — challenges the decision agent's ranking."""
+async def _expand_custom_path(profile: UserProfile, description: str) -> PathCandidate:
     prompt = (
         f"{_profile_block(profile)}\n"
-        f"User-selected paths ({len(paths)}):\n{_paths_json(paths)}\n\n"
-        f"Career evaluations:\n{career.model_dump_json(indent=2)}\n\n"
-        f"Finance evaluations:\n{finance.model_dump_json(indent=2)}\n\n"
-        f"Risk evaluations:\n{risk.model_dump_json(indent=2)}\n\n"
-        f"Lifestyle evaluations:\n{lifestyle.model_dump_json(indent=2)}\n\n"
-        f"Decision agent's ranking:\n{decision.model_dump_json(indent=2)}\n\n"
-        "Challenge this ranking. Return one PathCritique per ranked path (in the same "
-        "order as the decision's top3), plus overall_challenge and the most "
-        "overrated/underrated path ids (or null if the ranking is sound)."
+        f"User's description: {description}\n\n"
+        "Normalize this career idea into a structured PathCandidate."
     )
-    reply = await critic_agent.ask(prompt)
-    return await reply.content(retries=2)
+    reply = await path_expander.ask(prompt)
+    return await _parse_reply(reply, PathCandidate)
 
 
-async def run_pipeline(profile: UserProfile) -> DecisionOutput:
-    """Legacy single-shot pipeline — coordinator proposes 5, evaluators evaluate all 5."""
+async def run_pipeline(profile: UserProfile) -> SimulateResponse:
+    """Multi-agent debate pipeline: coordinator → evaluators → decision → critic → revision."""
     paths = await _generate_candidates(profile)
-    return await _analyze(profile, list(paths.paths))
+    selected = list(paths.paths)
+
+    # Phase 1: initial evaluation + ranking
+    initial = await _analyze(profile, selected)
+
+    # Phase 2: re-run evaluators for critic context, then critic challenges
+    career, finance, risk, lifestyle = await asyncio.gather(
+        _evaluate_career(profile, selected),
+        _evaluate_finance(profile, selected),
+        _evaluate_risk(profile, selected),
+        _evaluate_lifestyle(profile, selected),
+    )
+    critique = await _critique(profile, selected, career, finance, risk, lifestyle, initial)
+
+    # Phase 3: decision agent revises
+    revised = await _revise_decision(profile, selected, career, finance, risk, lifestyle, initial, critique)
+
+    # Compute revision summary
+    initial_ids = [p.path_id for p in initial.top3]
+    revised_ids = [p.path_id for p in revised.top3]
+    if initial_ids == revised_ids:
+        revision_summary = "Ranking order unchanged after critic review."
+    else:
+        revision_summary = f"Ranking changed after critic review: initial order {initial_ids}, revised order {revised_ids}."
+
+    return SimulateResponse(
+        final_ranking=revised,
+        critique=critique,
+        revision_summary=revision_summary,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -320,14 +367,13 @@ app = FastAPI(
     version="0.1.0",
     description=(
         "Multi-agent career-path sandbox on AG2 Beta. POST a UserProfile to "
-        "/simulate to get the top-3 ranked career paths. Use /simulate/stream "
-        "for live progress events via SSE."
+        "/simulate to get the top-3 ranked career paths."
     ),
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Hackathon: allow any frontend origin during dev.
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -336,7 +382,6 @@ app.add_middleware(
 
 @app.get("/")
 async def serve_frontend() -> FileResponse:
-    """Entry-page form. Submits to /simulate/stream and renders 3 ranked path cards."""
     return FileResponse(Path(__file__).parent / "frontend.html")
 
 
@@ -353,9 +398,10 @@ async def healthz() -> dict:
     }
 
 
-@app.post("/simulate", response_model=DecisionOutput)
-async def simulate(profile: UserProfile) -> DecisionOutput:
-    """Legacy single-shot pipeline. Coordinator proposes 5, all 5 evaluated + ranked."""
+@app.post("/simulate", response_model=SimulateResponse)
+async def simulate(profile: UserProfile) -> SimulateResponse:
+    """Multi-agent debate pipeline. Coordinator proposes 5, evaluators evaluate,
+    decision agent ranks, critic challenges, decision agent revises."""
     try:
         return await run_pipeline(profile)
     except Exception as exc:
@@ -364,7 +410,7 @@ async def simulate(profile: UserProfile) -> DecisionOutput:
 
 @app.post("/candidates", response_model=PathCandidates)
 async def candidates(profile: UserProfile) -> PathCandidates:
-    """Phase 1 of the new flow: coordinator proposes 5 candidate paths."""
+    """Phase 1: coordinator proposes 5 candidate paths."""
     try:
         return await _generate_candidates(profile)
     except Exception as exc:
@@ -373,11 +419,7 @@ async def candidates(profile: UserProfile) -> PathCandidates:
 
 @app.post("/expand-custom", response_model=PathCandidate)
 async def expand_custom(req: CustomPathRequest) -> PathCandidate:
-    """Normalize a user's free-form career idea into a structured PathCandidate.
-
-    Used when the user types their own path on the selection screen instead
-    of (or in addition to) picking from the coordinator's 5 proposals.
-    """
+    """Normalize a user's free-form career idea into a structured PathCandidate."""
     try:
         return await _expand_custom_path(req.profile, req.description)
     except Exception as exc:
@@ -396,37 +438,18 @@ async def career_advice(req: CareerAdviceRequest) -> CareerAdvice:
         f"{_profile_block(req.profile)}\n"
         f"Chosen path:\n{req.chosen.model_dump_json(indent=2)}\n\n"
         "Return courses, programs, personal_projects, and a headline tailored to this "
-        "user's stage / field / location and the demands of this specific path. "
-        "Use the chosen path's path_id verbatim."
+        "user's stage / field / location and the demands of this specific path."
     )
     try:
         reply = await career_advice_agent.ask(prompt)
-        return await reply.content(retries=2)
+        return await _parse_reply(reply, CareerAdvice)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/analyze/stream")
 async def analyze_stream(req: AnalyzeRequest) -> StreamingResponse:
-    """Phase 2 of the new flow: SSE stream that runs the 4 evaluators in
-    parallel on the user-selected paths, then the decision agent ranks them.
-
-    Multi-agent debate flow — decision agent runs twice, with the critic
-    in between. Only the REVISED ranking is sent to the client; the critique
-    payload is intentionally not emitted (it's an internal feedback signal).
-
-    Event sequence:
-        event: stage      data: {"stage": "evaluating"}
-        event: career     data: CareerOutput
-        event: finance    data: FinanceOutput
-        event: risk       data: RiskOutput
-        event: lifestyle  data: LifestyleOutput
-        event: stage      data: {"stage": "deciding"}    # decision pass 1 (internal)
-        event: stage      data: {"stage": "critiquing"}  # critic challenges (internal)
-        event: stage      data: {"stage": "revising"}    # decision pass 2
-        event: decision   data: DecisionOutput           # the FINAL revised ranking
-        event: done       data: {"ok": true}
-    """
+    """SSE stream with multi-agent debate flow."""
 
     async def event_stream() -> AsyncIterator[bytes]:
         def sse(event: str, payload: dict) -> bytes:
@@ -459,20 +482,20 @@ async def analyze_stream(req: AnalyzeRequest) -> StreamingResponse:
             initial = await _decide(
                 req.profile,
                 selected,
-                results["career"],     # type: ignore[arg-type]
-                results["finance"],    # type: ignore[arg-type]
-                results["risk"],       # type: ignore[arg-type]
-                results["lifestyle"],  # type: ignore[arg-type]
+                results["career"],
+                results["finance"],
+                results["risk"],
+                results["lifestyle"],
             )
 
             yield sse("stage", {"stage": "critiquing"})
             critique = await _critique(
                 req.profile,
                 selected,
-                results["career"],     # type: ignore[arg-type]
-                results["finance"],    # type: ignore[arg-type]
-                results["risk"],       # type: ignore[arg-type]
-                results["lifestyle"],  # type: ignore[arg-type]
+                results["career"],
+                results["finance"],
+                results["risk"],
+                results["lifestyle"],
                 initial,
             )
 
@@ -480,10 +503,10 @@ async def analyze_stream(req: AnalyzeRequest) -> StreamingResponse:
             revised = await _revise_decision(
                 req.profile,
                 selected,
-                results["career"],     # type: ignore[arg-type]
-                results["finance"],    # type: ignore[arg-type]
-                results["risk"],       # type: ignore[arg-type]
-                results["lifestyle"],  # type: ignore[arg-type]
+                results["career"],
+                results["finance"],
+                results["risk"],
+                results["lifestyle"],
                 initial,
                 critique,
             )
@@ -505,20 +528,7 @@ async def analyze_stream(req: AnalyzeRequest) -> StreamingResponse:
 
 @app.post("/simulate/stream")
 async def simulate_stream(profile: UserProfile) -> StreamingResponse:
-    """Run the pipeline and stream stage events via SSE.
-
-    Frontend usage (browser):
-        const res = await fetch('/simulate/stream', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify(profile),
-        });
-        const reader = res.body.getReader();  // parse SSE manually
-        // OR open with EventSource if you switch the endpoint to GET.
-
-    Each event has `event: <name>` and `data: <json>` lines. See module docstring
-    for the full event sequence.
-    """
+    """Run the pipeline and stream stage events via SSE."""
 
     async def event_stream() -> AsyncIterator[bytes]:
         def sse(event: str, payload: dict) -> bytes:
@@ -530,8 +540,6 @@ async def simulate_stream(profile: UserProfile) -> StreamingResponse:
             yield sse("candidates", paths.model_dump())
 
             yield sse("stage", {"stage": "evaluating"})
-
-            # Run evaluators in parallel; emit each as it finishes.
             selected = list(paths.paths)
             tasks = {
                 "career":    asyncio.create_task(_evaluate_career(profile, selected)),
@@ -548,7 +556,7 @@ async def simulate_stream(profile: UserProfile) -> StreamingResponse:
                 done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                 for task in done:
                     name = name_by_task[task]
-                    result = task.result()  # re-raises if the task raised
+                    result = task.result()
                     results[name] = result
                     yield sse(name, result.model_dump())
 
@@ -556,20 +564,20 @@ async def simulate_stream(profile: UserProfile) -> StreamingResponse:
             initial = await _decide(
                 profile,
                 selected,
-                results["career"],     # type: ignore[arg-type]
-                results["finance"],    # type: ignore[arg-type]
-                results["risk"],       # type: ignore[arg-type]
-                results["lifestyle"],  # type: ignore[arg-type]
+                results["career"],
+                results["finance"],
+                results["risk"],
+                results["lifestyle"],
             )
 
             yield sse("stage", {"stage": "critiquing"})
             critique = await _critique(
                 profile,
                 selected,
-                results["career"],     # type: ignore[arg-type]
-                results["finance"],    # type: ignore[arg-type]
-                results["risk"],       # type: ignore[arg-type]
-                results["lifestyle"],  # type: ignore[arg-type]
+                results["career"],
+                results["finance"],
+                results["risk"],
+                results["lifestyle"],
                 initial,
             )
 
@@ -577,10 +585,10 @@ async def simulate_stream(profile: UserProfile) -> StreamingResponse:
             revised = await _revise_decision(
                 profile,
                 selected,
-                results["career"],     # type: ignore[arg-type]
-                results["finance"],    # type: ignore[arg-type]
-                results["risk"],       # type: ignore[arg-type]
-                results["lifestyle"],  # type: ignore[arg-type]
+                results["career"],
+                results["finance"],
+                results["risk"],
+                results["lifestyle"],
                 initial,
                 critique,
             )
@@ -594,7 +602,7 @@ async def simulate_stream(profile: UserProfile) -> StreamingResponse:
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # disable proxy buffering
+            "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
         },
     )
@@ -602,13 +610,9 @@ async def simulate_stream(profile: UserProfile) -> StreamingResponse:
 
 @app.post("/ingest", response_model=IngestResponse)
 async def ingest_sources(req: IngestRequest) -> IngestResponse:
-    """Fetch each provided source, summarize the bundle, return both the summary
-    (for form pre-fill) and the raw extracts (to resubmit with /simulate)."""
-
+    """Fetch each provided source, summarize the bundle."""
     extracts: list[ProfileExtract] = []
 
-    # Fan out the three URL fetchers in parallel; use None as a placeholder for
-    # missing fields so we can pin the result tuple by position.
     github_task = ingest.fetch_github(req.github_url) if req.github_url else None
     linkedin_task = ingest.fetch_linkedin(req.linkedin_url) if req.linkedin_url else None
     other_task = ingest.fetch_generic(req.other_url) if req.other_url else None
@@ -682,7 +686,7 @@ async def ingest_sources(req: IngestRequest) -> IngestResponse:
 
     try:
         reply = await ingest_agent.ask(prompt)
-        summary: IngestSummary = await reply.content(retries=2)
+        summary: IngestSummary = await _parse_reply(reply, IngestSummary)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"ingest agent failed: {exc}") from exc
 
@@ -690,8 +694,6 @@ async def ingest_sources(req: IngestRequest) -> IngestResponse:
 
 
 if __name__ == "__main__":
-    # Validate provider env wiring at startup; build_config raises SystemExit
-    # if the required env vars are missing.
     build_config()
 
     import uvicorn

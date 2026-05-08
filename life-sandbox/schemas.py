@@ -143,11 +143,11 @@ class PathCritique(BaseModel):
     optimism_flags: Annotated[
         list[str],
         Field(
-            min_length=1,
+            default_factory=list,
             max_length=4,
             description="Specific evaluator assumptions that look optimistic — e.g. "
             "'salary curve assumes top-quartile placement', 'ruin_prob ignores 2024 layoff trend'. "
-            "1-4 items.",
+            "0-4 items.",
         ),
     ]
 
@@ -156,7 +156,7 @@ class CritiqueOutput(BaseModel):
     overall_challenge: Annotated[str, Field(description="2-3 sentences framing the strongest dissent on the ranking as a whole — or 'Ranking is sound' if no real issue.")]
     most_overrated_path_id: Annotated[str | None, Field(default=None, description="Path id the critic thinks is ranked too high. None if no issue.")]
     most_underrated_path_id: Annotated[str | None, Field(default=None, description="Path id the critic thinks is ranked too low. None if no issue.")]
-    per_path: Annotated[list[PathCritique], Field(min_length=1, max_length=5, description="One critique per ranked path, in the same order the decision agent ranked them.")]
+    per_path: Annotated[list[PathCritique], Field(min_length=0, max_length=5, description="One critique per ranked path, in the same order the decision agent ranked them.")]
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +207,13 @@ class IngestResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Career advice agent — runs after the user picks a single path
 # ---------------------------------------------------------------------------
+
+
+class SimulateResponse(BaseModel):
+    """Response from /simulate with multi-agent debate (decision → critic → revision)."""
+    final_ranking: DecisionOutput
+    critique: CritiqueOutput
+    revision_summary: Annotated[str | None, Field(default=None, description="Short summary of what changed between initial and revised ranking")]
 
 
 class CareerAdvice(BaseModel):

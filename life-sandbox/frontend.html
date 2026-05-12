@@ -416,6 +416,28 @@
     .why-label { font-size: 10px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; color: var(--muted); margin-bottom: 3px; }
     .why-text  { font-size: 12px; color: var(--text); line-height: 1.5; }
 
+    .critic-summary-bar {
+      margin: 12px 0 16px;
+    }
+    .critic-summary-banner {
+      background: linear-gradient(135deg, rgba(99,102,241,0.12), rgba(139,92,246,0.08));
+      border: 1px solid rgba(139,92,246,0.25);
+      border-radius: 10px;
+      padding: 12px 16px;
+      font-size: 12px;
+      line-height: 1.6;
+      color: var(--text);
+    }
+    .action-plan-block { margin-top: 12px; margin-bottom: 12px; }
+    .action-plan-list {
+      margin: 6px 0 0 0;
+      padding-left: 18px;
+      font-size: 12px;
+      line-height: 1.7;
+      color: var(--text);
+    }
+    .action-plan-list li { margin-bottom: 4px; }
+
     .btn-restart {
       width: 100%; padding: 13px; border-radius: 12px;
       background: transparent; border: 1px solid rgba(255,255,255,0.1);
@@ -984,6 +1006,7 @@
     <div class="results-wrap">
       <div class="results-title" id="results-title">Your simulated futures</div>
       <div class="results-sub" id="results-sub">Ranked by utility score</div>
+      <div id="critic-summary-bar" class="critic-summary-bar"></div>
       <div class="path-cards" id="path-cards"></div>
       <div id="compare-panel" class="compare-panel" hidden></div>
       <button class="btn-restart" onclick="restartFlow()">↺ Start over with different choices</button>
@@ -1764,6 +1787,29 @@
     document.getElementById('results-sub').textContent =
       `Ranked by utility · Risk ${(profile.risk_tolerance ?? 0.4).toFixed(2)} · Ambition ${(profile.ambition ?? 0.7).toFixed(2)}`;
 
+    // ── Critic summary banner ──
+    const criticSummary = data.critic_summary || null;
+    document.getElementById('critic-summary-bar').innerHTML = criticSummary
+      ? `<div style="background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;padding:16px;border-radius:8px;margin-bottom:20px;font-size:13px;line-height:1.6;">
+          <strong>经 Critic（批评家）复核</strong><br>
+          ${escapeHtml(criticSummary)}
+        </div>`
+      : '';
+
+    // ── Action plan (shared for all paths) ──
+    const actionPlanItems = (data.action_plan && Array.isArray(data.action_plan.items)) ? data.action_plan.items : null;
+
+    function renderActionPlanHtml() {
+      if (!actionPlanItems) return '';
+      const itemsHtml = actionPlanItems.map(item => `<li>${escapeHtml(item)}</li>`).join('');
+      return `<div style="background:#f8f9fa;padding:12px;border-left:4px solid #667eea;margin-top:12px;border-radius:0 6px 6px 0;font-size:12px;line-height:1.7;color:#1a1a2e;">
+          <strong>📋 你的下一步行动计划</strong>
+          <ul style="margin:6px 0 0 0;padding-left:18px;">
+            ${itemsHtml}
+          </ul>
+        </div>`;
+    }
+
     document.getElementById('path-cards').innerHTML = top3.map((p, i) => `
       <div class="path-card rank-${i + 1}" style="--card-delay:${0.05 + i * 0.13}s">
         <div class="card-header">
@@ -1794,6 +1840,7 @@
             <div class="why-label">Trade-offs</div>
             <div class="why-text">${escapeHtml(p.tradeoffs)}</div>
           </div>
+          ${renderActionPlanHtml()}
           <button class="advice-btn" type="button" data-idx="${i}" onclick="chooseCareerPath(${i})">
             Choose this path → Get my 12-month plan
           </button>

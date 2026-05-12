@@ -209,11 +209,18 @@ class IngestResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class ActionPlan(BaseModel):
+    """4 actionable steps from the action_planner agent."""
+    items: Annotated[list[str], Field(min_length=4, max_length=4, description="Exactly 4 action items covering courses, projects, and social activities")]
+
+
 class SimulateResponse(BaseModel):
     """Response from /simulate with multi-agent debate (decision → critic → revision)."""
     final_ranking: DecisionOutput
     critique: CritiqueOutput
     revision_summary: Annotated[str | None, Field(default=None, description="Short summary of what changed between initial and revised ranking")]
+    critic_summary: Annotated[str | None, Field(default=None, description="Critic总结 — formatted string with critique reasoning and revision direction")]
+    action_plan: Annotated[ActionPlan | None, Field(default=None, description="4 actionable steps from the action_planner agent")]
 
 
 class CareerAdvice(BaseModel):

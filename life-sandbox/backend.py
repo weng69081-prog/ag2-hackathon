@@ -60,9 +60,12 @@ from agents import (
     build_lifestyle_evaluator,
     build_path_expander,
     build_risk_evaluator,
+    build_action_planner,
 )
+from agents import ACTION_PLANNER_PROMPT
 import ingest
 from schemas import (
+    ActionPlan,
     AnalyzeRequest,
     CareerAdvice,
     CareerOutput,
@@ -139,6 +142,7 @@ critic_agent = build_critic()
 path_expander = build_path_expander()
 ingest_agent = build_ingest_agent()
 career_advice_agent = build_career_advice_agent()
+action_planner = build_action_planner()
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +275,22 @@ async def _critique(
     return await _parse_reply(reply, CritiqueOutput)
 
 
+async def _critique_with_timeout(
+    profile: UserProfile,
+    paths: list[PathCandidate],
+    career: CareerOutput,
+    finance: FinanceOutput,
+    risk: RiskOutput,
+    lifestyle: LifestyleOutput,
+    decision: DecisionOutput,
+) -> CritiqueOutput:
+    """Like _critique but with a 120-second timeout."""
+    return await asyncio.wait_for(
+        _critique(profile, paths, career, finance, risk, lifestyle, decision),
+        timeout=120,
+    )
+
+
 async def _revise_decision(
     profile: UserProfile,
     paths: list[PathCandidate],
@@ -322,6 +342,13 @@ async def _expand_custom_path(profile: UserProfile, description: str) -> PathCan
     return await _parse_reply(reply, PathCandidate)
 
 
+async def _generate_action_plan(paths_text: str) -> ActionPlan:
+    """Call action_planner agent to generate 4 actionable steps."""
+    prompt = ACTION_PLANNER_PROMPT.format(final_paths=paths_text)
+    reply = await asyncio.wait_for(action_planner.ask(prompt), timeout=120)
+    return await _parse_reply(reply, ActionPlan)
+
+
 async def run_pipeline(profile: UserProfile) -> SimulateResponse:
     """Multi-agent debate pipeline: coordinator → evaluators → decision → critic → revision."""
     paths = await _generate_candidates(profile)
@@ -337,10 +364,20 @@ async def run_pipeline(profile: UserProfile) -> SimulateResponse:
         _evaluate_risk(profile, selected),
         _evaluate_lifestyle(profile, selected),
     )
-    critique = await _critique(profile, selected, career, finance, risk, lifestyle, initial)
+    critique = await _critique_with_timeout(profile, selected, career, finance, risk, lifestyle, initial)
 
-    # Phase 3: decision agent revises
-    revised = await _revise_decision(profile, selected, career, finance, risk, lifestyle, initial, critique)
+    # Phase 3: decision agent revises — with 90s timeout + auto-retry
+    try:
+        revised = await asyncio.wait_for(
+            _revise_decision(profile, selected, career, finance, risk, lifestyle, initial, critique),
+            timeout=90,
+        )
+    except asyncio.TimeoutError:
+        # Auto-retry once
+        revised = await asyncio.wait_for(
+            _revise_decision(profile, selected, career, finance, risk, lifestyle, initial, critique),
+            timeout=90,
+        )
 
     # Compute revision summary
     initial_ids = [p.path_id for p in initial.top3]
@@ -350,10 +387,20 @@ async def run_pipeline(profile: UserProfile) -> SimulateResponse:
     else:
         revision_summary = f"Ranking changed after critic review: initial order {initial_ids}, revised order {revised_ids}."
 
+    # Build critic_summary
+    critique_text = critique.overall_challenge or ""
+    critic_summary = f"👉 经过 Critic（批评家）的复核，决定修订排名。关键调整理由：{critique_text}。修订方向：{revision_summary}"
+
+    # Generate action plan
+    paths_text = json.dumps([p.model_dump() for p in revised.top3], indent=2, ensure_ascii=False)
+    action_plan = await _generate_action_plan(paths_text)
+
     return SimulateResponse(
         final_ranking=revised,
         critique=critique,
         revision_summary=revision_summary,
+        critic_summary=critic_summary,
+        action_plan=action_plan,
     )
 
 
@@ -510,7 +557,26 @@ async def analyze_stream(req: AnalyzeRequest) -> StreamingResponse:
                 initial,
                 critique,
             )
-            yield sse("decision", revised.model_dump())
+
+            # Build critic_summary and action_plan
+            initial_ids = [p.path_id for p in initial.top3]
+            revised_ids = [p.path_id for p in revised.top3]
+            if initial_ids == revised_ids:
+                rev_summary = "Ranking order unchanged after critic review."
+            else:
+                rev_summary = f"Ranking changed after critic review: initial order {initial_ids}, revised order {revised_ids}."
+            critique_text = critique.overall_challenge or ""
+            critic_summary = f"👉 经过 Critic（批评家）的复核，决定修订排名。关键调整理由：{critique_text}。修订方向：{rev_summary}"
+
+            paths_text = json.dumps([p.model_dump() for p in revised.top3], indent=2, ensure_ascii=False)
+            action_plan = await _generate_action_plan(paths_text)
+
+            decision_payload = revised.model_dump()
+            decision_payload["critic_summary"] = critic_summary
+            if action_plan:
+                decision_payload["action_plan"] = action_plan.model_dump()
+
+            yield sse("decision", decision_payload)
             yield sse("done", {"ok": True})
         except Exception as exc:
             yield sse("error", {"error": str(exc)})
@@ -592,7 +658,26 @@ async def simulate_stream(profile: UserProfile) -> StreamingResponse:
                 initial,
                 critique,
             )
-            yield sse("decision", revised.model_dump())
+
+            # Build critic_summary and action_plan
+            initial_ids = [p.path_id for p in initial.top3]
+            revised_ids = [p.path_id for p in revised.top3]
+            if initial_ids == revised_ids:
+                rev_summary = "Ranking order unchanged after critic review."
+            else:
+                rev_summary = f"Ranking changed after critic review: initial order {initial_ids}, revised order {revised_ids}."
+            critique_text = critique.overall_challenge or ""
+            critic_summary = f"👉 经过 Critic（批评家）的复核，决定修订排名。关键调整理由：{critique_text}。修订方向：{rev_summary}"
+
+            paths_text = json.dumps([p.model_dump() for p in revised.top3], indent=2, ensure_ascii=False)
+            action_plan = await _generate_action_plan(paths_text)
+
+            decision_payload = revised.model_dump()
+            decision_payload["critic_summary"] = critic_summary
+            if action_plan:
+                decision_payload["action_plan"] = action_plan.model_dump()
+
+            yield sse("decision", decision_payload)
             yield sse("done", {"ok": True})
         except Exception as exc:
             yield sse("error", {"error": str(exc)})

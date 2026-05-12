@@ -233,6 +233,15 @@ INGEST_PROMPT = (
 )
 
 
+ACTION_PLANNER_PROMPT = (
+    "你是一名职业规划教练。根据以下职业路径，为一位计算机专业、中等风险偏好的用户，"
+    "列出下一步具体的 4 条行动计划，包括课程学习、项目实践、社交活动三个方面，用中文分条返回。\n\n"
+    "路径信息：{final_paths}\n\n"
+    "Return a JSON object with a single key \"items\" containing an array of exactly 4 strings, "
+    "each a concrete action item in Chinese. Return ONLY the JSON, no markdown, no explanation."
+)
+
+
 # ---------------------------------------------------------------------------
 # Factories — all agents use free-text responses (no response_schema)
 # ---------------------------------------------------------------------------
@@ -314,5 +323,13 @@ def build_career_advice_agent() -> Agent:
     return Agent(
         name="career_advice",
         prompt=CAREER_ADVICE_PROMPT,
+        config=build_config(),
+    )
+
+
+def build_action_planner() -> Agent:
+    return Agent(
+        name="action_planner",
+        prompt=ACTION_PLANNER_PROMPT,
         config=build_config(),
     )

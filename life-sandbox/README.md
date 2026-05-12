@@ -2,12 +2,13 @@
 
 Multi-agent career-path sandbox on **AG2 Beta**. Takes a user profile and
 returns the top 3 career paths with quantitative trade-offs (expected income,
-risk, growth) and an explanation tailored to the user's risk tolerance.
+risk, growth), a **Critic agent** challenge summary, and a **personalized action plan**.
 
 Built for the [AG2 Hackathon](https://luma.com/42lzgbrz). Demonstrates:
 
-- **Multi-agent orchestration** — 1 coordinator + 3 parallel domain evaluators + 1 decision agent.
-- **Structured output everywhere** — every agent has a Pydantic `response_schema`, so the API is fully typed end-to-end.
+- **改造亮点 ①：激活 Critic 批评家 Agent** — 形成"生成→批评→修订"辩论闭环。Coordinator 生成路径 → 4 个评估 Agent 并行打分 → Decision Agent 初次排名 → Critic 挑战排名 → Decision Agent 修订排名。
+- **改造亮点 ②：新增 Action Planner 行动规划 Agent** — 为每条职业路径自动生成 4 条具体行动计划（课程学习、项目实践、社交活动），以 `action_plan` 字段返回并在前端渲染。
+- **Multi-agent orchestration** — 1 coordinator + 4 parallel domain evaluators + 1 decision agent + 1 critic + 1 action planner。
 - **Quant-flavored modeling** — each path has a 5-year salary mean curve + stddev band, expected value, layoff hazard, and 5-year ruin probability.
 
 ## Architecture
@@ -15,18 +16,28 @@ Built for the [AG2 Hackathon](https://luma.com/42lzgbrz). Demonstrates:
 ```
 POST /simulate (UserProfile)
         ↓
-   coordinator                    →  PathCandidates (3 archetypes)
+   coordinator                    →  PathCandidates (5 archetypes)
         ↓
    asyncio.gather(
        career_eval,               →  CareerOutput   ┐
-       finance_eval,              →  FinanceOutput  ├ all run in parallel
-       risk_eval,                 →  RiskOutput     ┘
+       finance_eval,              →  FinanceOutput  ├── all run in parallel
+       risk_eval,                 →  RiskOutput     │
+       lifestyle_eval,            →  LifestyleOutput┘
    )
         ↓
-   decision_agent                 →  DecisionOutput (top 3 ranked)
+   decision_agent (initial)       →  DecisionOutput (initial ranking)
+        ↓
+   critic_agent                   →  CritiqueOutput (challenge)
+        ↓
+   decision_agent (revised)       →  DecisionOutput (revised ranking)
+        ↓
+   action_planner                 →  ActionPlan (4 steps)
+        ↓
+   return SimulateResponse (final_ranking + critic_summary + action_plan)
 ```
 
-5 LLM calls per request (1 coordinator + 3 evaluators in parallel + 1 decision).
+9 LLM calls per request (1 coordinator + 4 evaluators + 1 initial decision + 4 re-evaluators + 1 critic + 1 revised decision + 1 action planner).
+SSE streaming at `/analyze/stream` and `/simulate/stream` emits each agent's result as it finishes.
 
 ## Local development setup
 
@@ -295,13 +306,15 @@ authoritative source for the frontend.
 | `MODEL`            | provider default     | overrides per-provider default |
 | `PORT`             | `8765`               | server port |
 
-## What's next (not in MVP)
+## What's next (not in current sprint)
 
-Future agents — already named in the broader design but **not implemented this sprint**:
+Future agents — already named in the broader design but **not implemented yet**:
 
-- **Lifestyle agent** — work hours, location quality, burnout decay → happiness curve
 - **Personality fit agent** — turns user traits into utility weights instead of relying on `risk_tolerance`/`ambition` sliders
-- **Critic agent** — adversarial: injects worst-case scenarios ("what if AI hiring freezes?", "what if you fail twice before success?") and re-runs the pipeline against flipped distributions
 
-A debate loop (Critic vs domain agents, Decision agent as referee) would also
-make the multi-agent demo more impressive than the current linear pipeline.
+### Already implemented in this fork
+
+- ✅ **Critic agent** — adversarial: challenges the decision agent's ranking, forms a "generate → critique → revise" debate loop
+- ✅ **Action Planner agent** — generates 4 actionable steps (courses, projects, social) per career path
+- ✅ **Lifestyle evaluator** — work hours, pressure level, WLB score, burnout probability
+- ✅ **Frontend visualization** — Critic summary banner (purple gradient) + action plan cards rendered at the bottom of each path card

@@ -35,7 +35,7 @@ _PROVIDER_DEFAULTS = {
 }
 
 
-def build_config() -> ModelConfig:
+def build_config(max_tokens: int | None = None) -> ModelConfig:
     provider = os.environ.get("LLM_PROVIDER", "gemini").lower()
     if provider not in _PROVIDER_DEFAULTS:
         raise SystemExit(f"LLM_PROVIDER must be one of {list(_PROVIDER_DEFAULTS)}")
@@ -54,6 +54,7 @@ def build_config() -> ModelConfig:
             model=model,
             streaming=True,
             base_url=base_url,
+            max_tokens=max_tokens,
         )
         return config
     return GeminiConfig(model=model, streaming=False)
@@ -299,7 +300,7 @@ def build_decision_agent() -> Agent:
     return Agent(
         name="decision",
         prompt=DECISION_PROMPT,
-        config=build_config(),
+        config=build_config(max_tokens=2048),
     )
 
 

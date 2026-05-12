@@ -370,13 +370,13 @@ async def run_pipeline(profile: UserProfile) -> SimulateResponse:
     try:
         revised = await asyncio.wait_for(
             _revise_decision(profile, selected, career, finance, risk, lifestyle, initial, critique),
-            timeout=90,
+            timeout=180,
         )
     except asyncio.TimeoutError:
         # Auto-retry once
         revised = await asyncio.wait_for(
             _revise_decision(profile, selected, career, finance, risk, lifestyle, initial, critique),
-            timeout=90,
+            timeout=180,
         )
 
     # Compute revision summary
